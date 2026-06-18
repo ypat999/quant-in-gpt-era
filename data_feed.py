@@ -29,6 +29,15 @@ class StockDataOld:
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir)
     
+    @staticmethod
+    def _to_sina_symbol(code):
+        """将股票代码转换为新浪格式 (sh/sz + 代码)"""
+        code = code.split('.')[0]  # 去掉可能的后缀
+        if code.startswith('6') or code.startswith('9'):  # 沪市
+            return f'sh{code}'
+        else:  # 深市 (0/3开头) 和北交所 (8/4开头)
+            return f'sz{code}'
+    
     def save_to_csv(self, data, filename):
         """保存数据到CSV文件"""
         filepath = os.path.join(self.data_dir, filename)
@@ -90,20 +99,50 @@ class StockDataOld:
                     print(f"使用缓存的股票列表: {os.path.join(self.data_dir, cache_file)}")
                     return [stock for stock in cached_data if stock['update_time']]
 
-            # 在线获取
+            # 在线获取 - 优先新浪，失败切换东财
             print("获取最新股票列表...")
-            df = ak.stock_zh_a_spot_em()
+            df = None
+            last_err = None
+            # 尝试新浪
+            try:
+                df = ak.stock_zh_a_spot()
+            except Exception as e:
+                last_err = e
+                print(f"新浪获取失败: {e}")
+            # 新浪失败，尝试东财
+            if df is None:
+                print("新浪获取失败，切换到东财数据源...")
+                for attempt in range(3):
+                    try:
+                        df = ak.stock_zh_a_spot_em()
+                        break
+                    except Exception as e:
+                        last_err = e
+                        print(f"东财第 {attempt + 1}/3 次获取失败: {e}")
+                        time.sleep(3 * (attempt + 1))
+            if df is None:
+                # 在线获取失败，回退到缓存（即使过期）
+                cached_data = self.load_from_csv(cache_file)
+                if cached_data:
+                    print(f"在线获取失败，回退到缓存股票列表: {last_err}")
+                    return [stock for stock in cached_data if stock['update_time']]
+                raise Exception(f"新浪和东财均失败且无缓存: {last_err}")
 
             # 提取股票信息
             stocks = []
             for _, row in df.iterrows():
-                stocks.append({
+                stock_info = {
                     'name': row['名称'],
                     'code': row['代码'],
                     'price': float(row['最新价']),
-                    'pe': float(row['市盈率-动态']) if row['市盈率-动态'] != '-' else None,
                     'update_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                })
+                }
+                # 东财有市盈率字段，新浪没有
+                if '市盈率-动态' in row.index:
+                    stock_info['pe'] = float(row['市盈率-动态']) if row['市盈率-动态'] != '-' else None
+                else:
+                    stock_info['pe'] = None
+                stocks.append(stock_info)
             #按code排序
             stocks.sort(key=lambda x: x['code'])
             # 保存到缓存
@@ -245,26 +284,44 @@ class StockDataOld:
             
             if self.verbose_output:
                 print(f"外部查询时间范围: {start_date} 到 {end_date}")
-            for i in range(5):
-                try:
-                # 从akshare获取数据
-                    df_new = ak.stock_zh_a_hist(
-                        symbol=symbol,
-                        start_date=start_date.strftime('%Y%m%d'),
-                        end_date=end_date.strftime('%Y%m%d'),
-                        adjust='qfq'  # 前复权数据
-                    )
-                    
-                    if df_new is None or df_new.empty:
-                        print(f"没有获取到数据: {stock_code},akshare返回空数据")
-                    break
-                except Exception as e:
-                    print(f"获取股票数据接口出错 - {stock_code}: {str(e)}")
-                    time.sleep(random.uniform(30, 60))
+            df_new = None
+            # 优先从新浪获取数据
+            try:
+                sina_symbol = self._to_sina_symbol(symbol)
+                df_new = ak.stock_zh_a_daily(
+                    symbol=sina_symbol,
+                    start_date=start_date.strftime('%Y%m%d'),
+                    end_date=end_date.strftime('%Y%m%d'),
+                    adjust='qfq'
+                )
+            except Exception as e:
+                print(f"新浪获取出错 - {stock_code}: {str(e)}")
+            
+            # 新浪失败，切换东财
+            if df_new is None or df_new.empty:
+                print(f"新浪获取失败，切换东财数据源: {stock_code}")
+                for i in range(3):
+                    try:
+                        df_new = ak.stock_zh_a_hist(
+                            symbol=symbol,
+                            start_date=start_date.strftime('%Y%m%d'),
+                            end_date=end_date.strftime('%Y%m%d'),
+                            adjust='qfq'
+                        )
+                        if df_new is not None and not df_new.empty:
+                            break
+                        print(f"东财返回空数据: {stock_code}")
+                    except Exception as e:
+                        print(f"东财获取出错 - {stock_code}: {str(e)}")
+                        time.sleep(random.uniform(5, 15))
+            
+            if df_new is None or df_new.empty:
+                print(f"没有获取到数据: {stock_code}, 东财和新浪均失败")
             
             # self.quering_thread -= 1
 
             # 重命名列以匹配backtrader要求
+            # 东财返回中文列名，新浪返回英文列名，统一处理
             rename_dict = {
                 '日期': 'date',
                 '开盘': 'open',
@@ -971,8 +1028,8 @@ class StockDataOld:
 
 if __name__ == '__main__':
     #配置代理
-    os.environ['HTTP_PROXY'] = 'http://127.0.0.1:10809'
-    os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:10809'
+    # os.environ['HTTP_PROXY'] = 'http://127.0.0.1:10809'
+    # os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:10809'
     stock_data = StockDataOld()
     
     # 运行测试模式
