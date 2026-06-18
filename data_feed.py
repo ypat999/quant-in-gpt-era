@@ -31,12 +31,19 @@ class StockDataOld:
     
     @staticmethod
     def _to_sina_symbol(code):
-        """将股票代码转换为新浪格式 (sh/sz + 代码)"""
+        """将股票代码转换为新浪格式 (sh/sz + 代码)
+        沪市: 6开头(主板)、9开头(B股)、510/511/512/513/515/516/518/562/588/589(ETF/基金)
+        深市: 0开头(主板)、3开头(创业板)、159(ETF)、1开头(基金)、2开头(B股)
+        """
         code = code.split('.')[0]  # 去掉可能的后缀
-        if code.startswith('6') or code.startswith('9'):  # 沪市
+        # 沪市股票
+        if code.startswith('6') or code.startswith('9'):
             return f'sh{code}'
-        else:  # 深市 (0/3开头) 和北交所 (8/4开头)
-            return f'sz{code}'
+        # 沪市ETF/基金 (5开头且第二位为1/6/8)
+        if code.startswith('5') and len(code) == 6 and code[1] in ('1', '6', '8'):
+            return f'sh{code}'
+        # 深市 (0/3开头股票, 159/1/2开头基金等)
+        return f'sz{code}'
     
     def save_to_csv(self, data, filename):
         """保存数据到CSV文件"""
@@ -470,37 +477,46 @@ class StockDataOld:
             if self.verbose_output:
                 print(f"外部查询时间范围: {start_date} 到 {end_date}")
 
-            # 从akshare获取数据
-            for i in range(5):  # 最多尝试3次
-                df_new = None
-                try:
-                    df_new = ak.fund_etf_hist_em(
-                        symbol=fund_code,
-                        start_date=start_date.strftime('%Y%m%d'),
-                        end_date=end_date.strftime('%Y%m%d')
-                    )
-                except Exception as e:
-                    if self.verbose_output:
-                        print(f"获取基金历史数据失败 - {fund_code}: {str(e)}")
-                    pass
-                if df_new is not None:
-                    if not df_new.empty:
-                        break  # 请求成功，跳出循环
-                try:
-                    df_new = ak.fund_lof_hist_em(
-                        symbol=fund_code,
-                        start_date=end_date.strftime('%Y%m%d'),
-                        end_date=end_date.strftime('%Y%m%d')
-                    )
-                except Exception as e:
-                    if self.verbose_output:
-                        print(f"获取基金历史数据失败 - {fund_code}: {str(e)}")
-                    pass
-                if df_new is not None:
-                    if not df_new.empty:
-                        break  # 请求成功，跳出循环
-                    
-                time.sleep(3)  # 等待10秒后重试
+            # 优先从新浪获取数据
+            df_new = None
+            try:
+                sina_symbol = self._to_sina_symbol(fund_code)
+                df_new = ak.fund_etf_hist_sina(symbol=sina_symbol)
+                if df_new is not None and not df_new.empty:
+                    # 新浪返回全量数据，需要按日期筛选
+                    df_new['date'] = pd.to_datetime(df_new['date'])
+                    mask = (df_new['date'] >= pd.Timestamp(start_date)) & (df_new['date'] <= pd.Timestamp(end_date))
+                    df_new = df_new[mask]
+            except Exception as e:
+                print(f"新浪获取基金数据出错 - {fund_code}: {str(e)}")
+
+            # 新浪失败，切换东财
+            if df_new is None or df_new.empty:
+                for i in range(3):
+                    df_new = None
+                    try:
+                        df_new = ak.fund_etf_hist_em(
+                            symbol=fund_code,
+                            start_date=start_date.strftime('%Y%m%d'),
+                            end_date=end_date.strftime('%Y%m%d')
+                        )
+                    except Exception as e:
+                        if self.verbose_output:
+                            print(f"东财ETF获取失败 - {fund_code}: {str(e)}")
+                    if df_new is not None and not df_new.empty:
+                        break
+                    try:
+                        df_new = ak.fund_lof_hist_em(
+                            symbol=fund_code,
+                            start_date=start_date.strftime('%Y%m%d'),
+                            end_date=end_date.strftime('%Y%m%d')
+                        )
+                    except Exception as e:
+                        if self.verbose_output:
+                            print(f"东财LOF获取失败 - {fund_code}: {str(e)}")
+                    if df_new is not None and not df_new.empty:
+                        break
+                    time.sleep(3)
             
             # self.quering_thread -= 1
 
@@ -514,6 +530,7 @@ class StockDataOld:
                 else : return None
             
             # 重命名列以匹配backtrader要求
+            # 东财返回中文列名，新浪返回英文列名，统一处理
             rename_dict = {
                 '日期': 'date',
                 '开盘': 'open',
@@ -531,8 +548,9 @@ class StockDataOld:
             
             df_new.rename(columns=rename_dict, inplace=True)
             
-            # 转换日期列为datetime
-            df_new['date'] = pd.to_datetime(df_new['date'])
+            # 新浪数据日期可能已被转换过，确保统一格式
+            if not pd.api.types.is_datetime64_any_dtype(df_new['date']):
+                df_new['date'] = pd.to_datetime(df_new['date'])
             
             # 设置日期为索引
             df_new.set_index('date', inplace=True)
