@@ -92,10 +92,10 @@ class CNNStrategy(bt.Strategy):
             if len(data) < self.params.lookback:
                 continue
             
-            # 获取过去30天的5维特征数据
+            # 获取过去lookback天的7维特征数据
             stock_data = np.array([[data.open[-i], data.high[-i], data.low[-i], 
                                   data.close[-i], data.volume[-i],
-                                  data.amount[-i], data.turnover_rate[-i]] 
+                                  data.amount[-i], data.turnover[-i]] 
                                  for i in range(self.params.lookback)])
             
             # 数据标准化并重塑为CNN输入形状 (batch, features, time_steps)

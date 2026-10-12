@@ -35,6 +35,9 @@ class PeterLynchStrategy(bt.Strategy):
         self.candidates = {}
         self.holdings = {}
         
+        # 财务数据存储
+        self.fundamental_data = {}
+        
         # 技术指标
         self.pe = {}
         self.profit_growth = {}
@@ -57,18 +60,39 @@ class PeterLynchStrategy(bt.Strategy):
                 self.process_fundamental_data(symbol, finance_data)
     
     def process_fundamental_data(self, symbol, finance_data):
-        """处理财务数据"""
+        """处理财务数据
+        
+        字段名对应 stock_financial_analysis_indicator 返回的中文列名
+        """
         try:
             latest_report = finance_data[0]
             
             # 提取关键指标
-            self.pe[symbol] = float(latest_report.get('市盈率', 0))
-            self.profit_growth[symbol] = float(latest_report.get('净利润同比增长率', 0))
-            self.inventory_turnover[symbol] = float(latest_report.get('存货周转率', 0))
-            self.revenue_growth[symbol] = float(latest_report.get('营业收入同比增长率', 0))
+            self.pe[symbol] = self._safe_float(latest_report.get('市盈率', 0))
+            self.profit_growth[symbol] = self._safe_float(latest_report.get('净利润同比增长率(%)', 0))
+            self.inventory_turnover[symbol] = self._safe_float(latest_report.get('存货周转率', 0))
+            self.revenue_growth[symbol] = self._safe_float(latest_report.get('营业收入同比增长率(%)', 0))
+            
+            # 同步填充 fundamental_data，供 get_fundamental_value() 使用
+            self.fundamental_data[symbol] = {
+                'total_profit': self._safe_float(latest_report.get('净利润', 0)),
+                'pcf_ratio': self._safe_float(latest_report.get('市现率', 0)),
+                'debt_ratio': self._safe_float(latest_report.get('资产负债率(%)', 0)),
+            }
             
         except (KeyError, ValueError, IndexError) as e:
             print(f"处理财务数据出错 - {symbol}: {str(e)}")
+    
+    @staticmethod
+    def _safe_float(value):
+        """安全转换为浮点数，处理带单位/百分号的字符串"""
+        if value is None or value == '' or value == '-':
+            return 0.0
+        try:
+            s = str(value).replace(',', '').replace('%', '').replace('元', '')
+            return float(s)
+        except (ValueError, TypeError):
+            return 0.0
     
     def next(self):
         """每个交易日调用一次"""
@@ -183,9 +207,8 @@ class PeterLynchStrategy(bt.Strategy):
     def get_fundamental_value(self, symbol, field):
         """获取基本面数据"""
         try:
-            # 这里需要根据实际数据源进行修改
             return self.fundamental_data[symbol][field]
-        except:
+        except (KeyError, TypeError):
             return None
         
     def log(self, txt, dt=None):

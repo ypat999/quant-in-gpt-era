@@ -39,13 +39,13 @@ class FinanceData:
         """
         print("开始更新所有数据...")
         
-        # 更新股票日线数据
+        # 更新股票日线数据（混合方式：全市场接口补今日 + 个股接口补断档）
         print("\n更新股票日线数据...")
-        self.stock_data.batch_update_daily_data_thread(thread_num=thread_num)
+        self.stock_data.batch_update_daily_hybrid(thread_num=thread_num)
         
         # 更新股票财务数据
         print("\n更新股票财务数据...")
-        # self.stock_data.batch_update_report_data(stocks)
+        self.stock_data.batch_update_report_data()
         
         # 更新基金日线数据
         print("\n更新基金日线数据...")
@@ -59,8 +59,8 @@ class FinanceData:
 
 # 主程序入口
 if __name__ == '__main__':
-    os.environ['HTTP_PROXY'] = 'http://127.0.0.1:10809'
-    os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:10809'
+    # os.environ['HTTP_PROXY'] = 'http://127.0.0.1:10809'
+    # os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:10809'
     # 创建FinanceData实例
     stock_data = FinanceData()
     

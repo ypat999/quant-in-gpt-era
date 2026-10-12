@@ -9,6 +9,17 @@ from data_feed import StockData
 class StockSelector:
     def __init__(self):
         self.stock_data = StockData()
+    
+    @staticmethod
+    def _safe_float(value):
+        """安全转换为浮点数，处理带单位/百分号的字符串"""
+        if value is None or value == '' or value == '-':
+            return 0.0
+        try:
+            s = str(value).replace(',', '').replace('%', '').replace('元', '')
+            return float(s)
+        except (ValueError, TypeError):
+            return 0.0
         
     def select_stocks(self):
         """选股主函数"""
@@ -38,13 +49,13 @@ class StockSelector:
                         latest_data = finance_data_single
                 # 检查是否满足条件，原始条件为20/40/5
                 try:
-                    if (float(latest_data['净资产收益率(ROE)']) > 20 and
-                        float(latest_data['毛利率']) > 40 and
-                        float(latest_data['销售净利率']) > 5):
+                    if (self._safe_float(latest_data.get('净资产收益率(%)', 0)) > 20 and
+                        self._safe_float(latest_data.get('销售毛利率(%)', 0)) > 40 and
+                        self._safe_float(latest_data.get('销售净利率(%)', 0)) > 5):
                         stock.update({
-                            'roe': float(latest_data['净资产收益率(ROE)']),
-                            'gross_margin': float(latest_data['毛利率']),
-                            'net_margin': float(latest_data['销售净利率']),
+                            'roe': self._safe_float(latest_data.get('净资产收益率(%)', 0)),
+                            'gross_margin': self._safe_float(latest_data.get('销售毛利率(%)', 0)),
+                            'net_margin': self._safe_float(latest_data.get('销售净利率(%)', 0)),
                             'report_date': latest_period
                         })
                         with lock:

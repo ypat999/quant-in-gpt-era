@@ -46,7 +46,8 @@ class StockData:
         filepath = os.path.join(self.data_dir, filename)
         if os.path.exists(filepath):
             try:
-                df = pd.read_csv(filepath, encoding='utf-8', dtype={'code': str})
+                # 读取时指定所有列都作为字符串，避免日期等列被自动转换为数字
+                df = pd.read_csv(filepath, encoding='utf-8-sig', dtype=str)
                 if self.verbose_output:
                     print(f"加载数据: {os.path.abspath(filepath)}")
                 return df.to_dict(orient='records')
@@ -54,6 +55,33 @@ class StockData:
                 print(f"读取文件出错 {filename}: {str(e)}")
                 return None
         return None
+
+    def _is_cache_fresh(self, filename):
+        """快速判断缓存是否新鲜，通过文件修改时间而非解析数据
+        
+        规则：如果文件修改时间在今天15:00之后（收盘后），则数据是新鲜的
+        返回: (is_fresh, filepath)
+        """
+        filepath = os.path.join(self.data_dir, filename)
+        if not os.path.exists(filepath):
+            return False, filepath
+        
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+            now = datetime.now()
+            
+            # 今天15:00后更新的文件，数据是新鲜的
+            today_cutoff = now.replace(hour=15, minute=0, second=0, microsecond=0)
+            
+            if now >= today_cutoff:
+                # 当前在收盘后，文件必须是今天15:00后更新的
+                return mtime >= today_cutoff, filepath
+            else:
+                # 当前在开盘前/盘中，文件必须是昨天15:00后更新的
+                yesterday_cutoff = (now - timedelta(days=1)).replace(hour=15, minute=0, second=0, microsecond=0)
+                return mtime >= yesterday_cutoff, filepath
+        except Exception:
+            return False, filepath
 
     def _get_stock_list(self, update = False, cache_file = 'stock_list.csv'):
         """获取股票列表"""
@@ -67,18 +95,65 @@ class StockData:
 
             # 在线获取
             print("获取最新股票列表...")
-            df = ak.stock_zh_a_spot_em()
+            df = None
+            last_err = None
+            
+            # 优先尝试新浪接口
+            try:
+                df = ak.stock_zh_a_spot()
+                print("成功从新浪接口获取股票列表")
+            except Exception as e:
+                last_err = e
+                print(f"新浪接口获取失败: {e}")
+            
+            # 新浪失败,尝试东财接口(备选)
+            if df is None:
+                print("新浪接口失败,尝试东财接口...")
+                for attempt in range(3):
+                    try:
+                        df = ak.stock_zh_a_spot_em()
+                        print("成功从东财接口获取股票列表")
+                        break
+                    except Exception as e:
+                        last_err = e
+                        print(f"东财接口第 {attempt + 1}/3 次获取失败: {e}")
+                        time.sleep(3 * (attempt + 1))
+            
+            # 所有接口都失败,回退到缓存(即使过期)
+            if df is None:
+                cached_data = self.load_from_csv(cache_file)
+                if cached_data:
+                    print(f"在线获取失败,回退到缓存股票列表: {last_err}")
+                    return [stock for stock in cached_data if stock['update_time']]
+                print(f"获取股票列表失败: {last_err}")
+                return []
 
             # 提取股票信息
             stocks = []
             for _, row in df.iterrows():
-                stocks.append({
-                    'name': row['名称'],
-                    'code': row['代码'],
-                    'price': float(row['最新价']),
-                    'pe': float(row['市盈率-动态']) if row['市盈率-动态'] != '-' else None,
-                    'update_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                })
+                try:
+                    # 处理股票代码,去除前缀(如"sz", "sh", "bj")
+                    code = str(row['代码'])
+                    if code.startswith(('sz', 'sh', 'bj')):
+                        code = code[2:]  # 去除前2个字符的前缀
+                    
+                    # 新浪接口没有市盈率字段,设置为None
+                    pe_value = None
+                    # 如果是东财接口,尝试获取市盈率
+                    if '市盈率-动态' in df.columns:
+                        pe_value = float(row['市盈率-动态']) if row['市盈率-动态'] != '-' else None
+                    
+                    stocks.append({
+                        'name': row['名称'],
+                        'code': code,
+                        'price': float(row['最新价']),
+                        'pe': pe_value,
+                        'update_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                except Exception as e:
+                    if self.verbose_output:
+                        print(f"处理股票 {row.get('代码', 'unknown')} 数据时出错: {e}")
+                    continue
             #按code排序
             stocks.sort(key=lambda x: x['code'])
             # 保存到缓存
@@ -119,9 +194,7 @@ class StockData:
         df = None
         
         try:
-            # 确定缓存文件名
             cache_file = f'daily_{code}.csv'
-            cached_data = self.load_from_csv(cache_file)
             
             # 设置默认日期范围
             if not end_date:
@@ -129,23 +202,44 @@ class StockData:
             if not start_date:
                 start_date = end_date - timedelta(days=365*40)
             
+            # 快速判断缓存是否新鲜（通过文件修改时间，不解析CSV）
+            is_fresh, filepath = self._is_cache_fresh(cache_file)
+            
+            if is_fresh:
+                # 缓存新鲜，直接加载返回
+                cached_data = self.load_from_csv(cache_file)
+                if cached_data:
+                    df = pd.DataFrame(cached_data)
+                    df['date'] = pd.to_datetime(df['date'])
+                    df.set_index('date', inplace=True)
+                    
+                    if local_only:
+                        return df
+                    
+                    # 截取所需时间段
+                    mask = (df.index >= pd.Timestamp(start_date)) & (df.index <= pd.Timestamp(end_date))
+                    return df[mask]
+            
+            # 缓存不新鲜或不存在，需要判断是加载旧缓存增量更新，还是全新获取
+            cached_data = self.load_from_csv(cache_file)
+            
             if cached_data:
                 df = pd.DataFrame(cached_data)
                 df['date'] = pd.to_datetime(df['date'])
                 df.set_index('date', inplace=True)
                 
-                # 检查是否需要更新
+                if local_only:
+                    return df
+                
+                # 检查缓存最新日期，决定增量更新的起始日期
                 last_date = df.index.max() + timedelta(hours=15)
-                if pd.Timestamp(last_date) >= pd.Timestamp(end_date - timedelta(hours=19)) or local_only:
-                    # 截取所需时间段的数据
+                if pd.Timestamp(last_date) >= pd.Timestamp(end_date - timedelta(hours=19)):
+                    # 数据已是最新（文件修改时间判断不准确时回退验证）
                     mask = (df.index >= pd.Timestamp(start_date)) & (df.index <= pd.Timestamp(end_date))
-                    if self.verbose_output:
-                        print(f"使用缓存数据: {os.path.abspath(cache_file)}")
                     return df[mask]
                 else:
                     start_date = last_date + timedelta(days=1) - timedelta(hours=15)
-                    if self.verbose_output:
-                        print(f"缓存数据已过期，重新获取缺失的最新数据: ", start_date)
+                    print(f"缓存数据已过期，增量获取: {code} (从 {start_date.strftime('%Y-%m-%d')})")
             
             if local_only:
                 return None
@@ -160,48 +254,104 @@ class StockData:
                 print(f"外部查询时间范围: {start_date} 到 {end_date}")
 
             # 获取股票数据
-            symbol = code  # 股票代码格式处理
+            # 主数据源: 新浪接口 (stock_zh_a_daily)
+            # 备选数据源: 雅虎财经 (需安装yfinance: pip install yfinance)
+            df_new = None
+            
+            # 构建市场前缀 (新浪接口需要)
+            if code.startswith('6'):
+                sina_symbol = f"sh{code}"  # 上交所
+            elif code.startswith('92'):
+                sina_symbol = f"bj{code}"  # 北交所 (92开头)
+            elif code.startswith('0') or code.startswith('3'):
+                sina_symbol = f"sz{code}"  # 深交所
+            elif code.startswith('8') or code.startswith('4'):
+                sina_symbol = f"bj{code}"  # 北交所 (其他)
+            else:
+                sina_symbol = f"sz{code}"  # 默认深交所
+            
+            # 尝试从新浪接口获取数据
+            ssl_error_count = 0
             for i in range(5):
                 try:
-                    # 从akshare获取数据
-                    df_new = ak.stock_zh_a_hist(
-                        symbol=symbol,
-                        start_date=start_date.strftime('%Y%m%d'),
-                        end_date=end_date.strftime('%Y%m%d'),
+                    df_new = ak.stock_zh_a_daily(
+                        symbol=sina_symbol,
+                        start_date=start_date.strftime('%Y-%m-%d'),
+                        end_date=end_date.strftime('%Y-%m-%d'),
                         adjust='qfq'  # 前复权数据
                     )
                     
-                    if df_new is None or df_new.empty:
-                        print(f"没有获取到数据: {code},akshare返回空数据")
-                    break
+                    if df_new is not None and not df_new.empty:
+                        if self.verbose_output:
+                            print(f"成功从新浪接口获取数据: {sina_symbol}")
+                        break
+                    else:
+                        print(f"新浪接口返回空数据: {code}")
                 except Exception as e:
-                    print(f"获取股票数据接口出错 - {code}: {str(e)}")
+                    error_msg = str(e)
+                    # 检测SSL证书错误
+                    if 'SSL' in error_msg or 'CERTIFICATE_VERIFY_FAILED' in error_msg or 'Hostname mismatch' in error_msg:
+                        ssl_error_count += 1
+                        if ssl_error_count == 1:  # 只在第一次SSL错误时提示
+                            print(f"⚠️ SSL证书验证失败 - {code}: 可能是网络代理或证书问题")
+                            print(f"   建议检查: 1) 是否使用代理 2) 系统时间是否正确 3) 继续重试...")
+                        if ssl_error_count >= 3:  # SSL错误超过3次，跳过该股票
+                            print(f"SSL错误持续发生，跳过股票 {code}")
+                            df_new = None
+                            break
+                    else:
+                        print(f"新浪接口获取数据出错 - {code}: {error_msg}")
                     time.sleep(random.uniform(30, 60))
             
+            # 如果新浪接口失败,尝试雅虎财经(如果已安装yfinance)
             if df_new is None or df_new.empty:
-                print(f"没有获取到数据: {code},akshare返回空数据")
-                if df: 
+                try:
+                    import yfinance as yf
+                    # 转换股票代码格式: 000001 -> 000001.SZ 或 600000 -> 600000.SS
+                    if code.startswith('6'):
+                        yf_symbol = f"{code}.SS"  # 上交所
+                    elif code.startswith('0') or code.startswith('3'):
+                        yf_symbol = f"{code}.SZ"  # 深交所
+                    else:
+                        yf_symbol = f"{code}.SZ"  # 默认深交所
+                    
+                    print(f"尝试从雅虎财经获取数据: {yf_symbol}")
+                    ticker = yf.Ticker(yf_symbol)
+                    df_yf = ticker.history(
+                        start=start_date.strftime('%Y-%m-%d'),
+                        end=end_date.strftime('%Y-%m-%d')
+                    )
+                    
+                    if df_yf is not None and not df_yf.empty:
+                        # 转换雅虎财经数据格式
+                        df_new = df_yf.reset_index()
+                        df_new.columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'turnover', 'pct_change']
+                        print(f"成功从雅虎财经获取数据: {yf_symbol}")
+                except ImportError:
+                    if self.verbose_output:
+                        print("未安装yfinance库,跳过雅虎财经备选方案")
+                except Exception as e:
+                    if self.verbose_output:
+                        print(f"雅虎财经获取失败: {e}")
+            
+            if df_new is None or df_new.empty:
+                print(f"没有获取到数据: {code},新浪接口返回空数据")
+                # 返回之前已有的数据(如果有)
+                if df is not None and not df.empty: 
                     return df
                 else: 
                     return None
             
-            # 重命名列以匹配backtrader要求
-            rename_dict = {
-                '日期': 'date',
-                '开盘': 'open',
-                '收盘': 'close',
-                '最高': 'high',
-                '最低': 'low',
-                '成交量': 'volume',
-                '成交额': 'amount',
-                '振幅': 'amplitude',
-                '涨跌幅': 'pct_change',
-                '涨跌额': 'change',
-                '换手率': 'turnover',
-                '股票代码': 'code'
-            }
+            # 新浪接口列名已经是英文,只需确保包含必要列
+            # 列名: ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'outstanding_share', 'turnover']
+            # 只保留需要的列
+            required_columns = ['date', 'open', 'high', 'low', 'close', 'volume']
             
-            df_new.rename(columns=rename_dict, inplace=True)
+            # 确保必要的列存在
+            for col in required_columns:
+                if col not in df_new.columns:
+                    print(f"警告: {code} 数据缺少必要列: {col}")
+                    return None
             
             # 转换日期列为datetime
             df_new['date'] = pd.to_datetime(df_new['date'])
@@ -257,18 +407,26 @@ class StockData:
         
         Args:
             stock_code: 股票代码
+        Returns:
+            True: 数据已最新或更新成功
+            'cache_hit': 缓存命中，数据已是最新
+            False: 更新失败
         """
         stock_code = str(stock_code).split('.')[0]  # 去掉后缀
         
+        # 快速判断缓存是否新鲜，如果新鲜直接返回，不解析CSV
+        cache_file = f'daily_{stock_code}.csv'
+        is_fresh, _ = self._is_cache_fresh(cache_file)
+        if is_fresh:
+            return 'cache_hit'
+        
         try:
-            # 获取股票历史数据
+            # 获取股票历史数据（缓存不新鲜时才走这里）
             df = self.get_history_data(stock_code)
             
             if df is not None and not df.empty:
-                print(f"成功更新 {stock_code} 的日线数据")
                 return True
             else:
-                print(f"未能获取到 {stock_code} 的日线数据")
                 return False
                 
         except Exception as e:
@@ -296,37 +454,91 @@ class StockData:
         success_count = 0
         fail_count = 0
         
+        # 性能统计
+        total_start_time = time.time()
+        last_report_time = total_start_time
+        processed_count = 0
+        cache_hit_count = 0  # 缓存命中次数
+        
+        # 各步骤耗时统计
+        step_times = {
+            'check_price': 0.0,
+            'update_func': 0.0,
+            'total': 0.0
+        }
+        
         # 定义线程锁，用于线程间共享资源的安全访问
         lock = threading.Lock()
         
         def update_item_data(item):
-            nonlocal success_count, fail_count
-
+            nonlocal success_count, fail_count, processed_count, last_report_time
+            nonlocal step_times, cache_hit_count
+            
+            item_start_time = time.time()
+            
             code = str(item['code'])
             name = item['name']
-            if np.isnan(item['price']):
+            
+            # 步骤1：检查价格
+            step_start = time.time()
+            try:
+                price = float(item['price']) if item['price'] != 'nan' else np.nan
+            except (ValueError, TypeError):
+                price = np.nan
+            
+            if pd.isna(price):
                 print(f"股票 {code} 价格为空，跳过数据更新")
                 return False  
+            step_times['check_price'] += time.time() - step_start
+            
             if self.verbose_output:
                 print(f"\n正在获取 {code} {name} 的数据...")
 
             try:
-                # 更新数据
-                if update_func(code):
+                # 步骤2：更新数据
+                step_start = time.time()
+                result = update_func(code)
+                step_times['update_func'] += time.time() - step_start
+                
+                if result:  # True 或 'cache_hit'
                     with lock:
                         success_count += 1
+                        processed_count += 1
+                        if result == 'cache_hit':
+                            cache_hit_count += 1
                     print(f"处理股票 {code} 完成，总成功数量: {success_count}，总失败数量: {fail_count}")
-                    return True
+                    result = True
                 else:
                     print(f"处理股票 {code} 时出错")
                     with lock:
                         fail_count += 1
-                    return False
+                        processed_count += 1
+                    result = False
+                
+                # 每分钟输出一次性能统计
+                current_time = time.time()
+                if current_time - last_report_time >= 60:
+                    elapsed = current_time - total_start_time
+                    avg_time = elapsed / processed_count if processed_count > 0 else 0
+                    
+                    print(f"\n{'='*60}")
+                    print(f"性能统计（已处理 {processed_count}/{len(items)} 只）:")
+                    print(f"  总耗时: {elapsed:.1f}秒")
+                    print(f"  平均每只: {avg_time:.3f}秒")
+                    print(f"  缓存命中: {cache_hit_count} 只 (跳过网络请求)")
+                    print(f"  步骤耗时:")
+                    print(f"    - 检查价格: {step_times['check_price']:.2f}秒 ({step_times['check_price']/elapsed*100:.1f}%)")
+                    print(f"    - 更新数据: {step_times['update_func']:.2f}秒 ({step_times['update_func']/elapsed*100:.1f}%)")
+                    print(f"{'='*60}\n")
+                    last_report_time = current_time
+                
+                return result
 
             except Exception as e:
                 print(f"处理股票 {code} 时出错: {str(e)}")
                 with lock:
                     fail_count += 1
+                    processed_count += 1
                 return False
         
 
@@ -390,28 +602,50 @@ class StockData:
         stock_code = str(stock_code)
         stock_code = stock_code.split('.')[0]  # 去掉后缀
         try:
-            # 检查是否已有数据
-
             filename = f'finance_{stock_code}.csv'
-            cached_data = self.load_from_csv(filename)
-            
             filepath = os.path.join(self.data_dir, filename)
             
-            if cached_data:
-                # 检查数据是否超过3个月
-                if '日期' in cached_data[0]:
-                    # 解析最新财务数据的日期
+            # 加载缓存数据（后续无论成功失败都可能用到）
+            cached_data = self.load_from_csv(filename)
+            
+            # 快速判断：缓存新鲜则直接返回
+            is_fresh, _ = self._is_cache_fresh(filename)
+            if is_fresh and cached_data:
+                if self.verbose_output:
+                    print(f"使用缓存的财务数据: {stock_code}")
+                return cached_data
+            
+            # 检查是否有"获取失败"的标记文件（7天内不再重试在线获取）
+            fail_flag = filepath + '.fail'
+            if os.path.exists(fail_flag):
+                fail_mtime = datetime.fromtimestamp(os.path.getmtime(fail_flag))
+                if (datetime.now() - fail_mtime).days < 7:
+                    # 不重试在线获取，但有旧缓存就返回旧数据
+                    if cached_data:
+                        return cached_data
+                    return None
+                else:
+                    os.remove(fail_flag)  # 超过7天，删除标记重试
+            
+            # 检查缓存数据是否在有效期内
+            # 季度财报每3个月发布，加上1-2个月报告延迟，最新数据可能就有4-5个月"旧"
+            # 所以阈值设为150天（5个月），避免反复获取同样"旧"的数据
+            if cached_data and '日期' in cached_data[0]:
+                try:
                     latest_date_str = str(cached_data[0]['日期'])
+                    if '.' in latest_date_str:
+                        latest_date_str = latest_date_str.split('.')[0]
                     latest_date = datetime.strptime(latest_date_str, '%Y%m%d')
                     current_date = datetime.now()
                     
-                    # 如果数据超过3个月，则重新获取
-                    if (current_date - latest_date).days > 90:
-                        print(f"财务数据已超过3个月，重新获取: {stock_code}")
-                    else:
+                    if (current_date - latest_date).days <= 150:
                         if self.verbose_output:
-                            print(f"使用缓存的财务数据: {os.path.abspath(filepath)}")
+                            print(f"使用缓存的财务数据: {stock_code}")
                         return cached_data
+                    else:
+                        print(f"财务数据已超过5个月，尝试重新获取: {stock_code}")
+                except (ValueError, TypeError) as e:
+                    print(f"财务数据日期解析失败: {stock_code}, 尝试重新获取")
             
             # 在线获取数据
             print(f"在线获取股票财务数据: {stock_code}")
@@ -419,35 +653,239 @@ class StockData:
             
             if df is None or df.empty:
                 print(f"无法获取股票财务数据: {stock_code}")
+                # 写入失败标记，7天内不再重试
+                with open(fail_flag, 'w') as f:
+                    f.write(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
+                # 在线获取失败，但有旧缓存就返回旧数据（旧数据比没数据好）
+                if cached_data:
+                    print(f"使用过期缓存的财务数据: {stock_code}")
+                    return cached_data
                 return None
             
-            # print(df)
-            # 删除df第一列
             df = df.drop(df.columns[0], axis=1)
-            #将df的index设置为df的第一列
             df.index = df.iloc[:, 0]
             df = df.drop(df.columns[0], axis=1)
-            # print(df)
-            #复制df的标题并复制到第一行
-
             
             df = df.T
             df.reset_index(inplace=True)
             df.rename(columns={'index': '日期'}, inplace=True)
-            # print(df)
-
-            # 保存到文件
 
             self.save_to_csv(df, filename)
             if self.verbose_output:
                 print(f"已保存 {stock_code} 的财务数据")
+            # 获取成功，删除可能存在的失败标记
+            if os.path.exists(fail_flag):
+                os.remove(fail_flag)
             return df
 
             
         except Exception as e:
             print(f"获取财务数据出错 - {stock_code}: {str(e)}")
-            time.sleep(random.uniform(100, 200))
+            # 写入失败标记，7天内不再重试
+            fail_flag = os.path.join(self.data_dir, f'finance_{stock_code}.csv.fail')
+            with open(fail_flag, 'w') as f:
+                f.write(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
+            # 在线获取失败，但有旧缓存就返回旧数据
+            cached_data = self.load_from_csv(f'finance_{stock_code}.csv')
+            if cached_data:
+                print(f"使用过期缓存的财务数据: {stock_code}")
+                return cached_data
             return None
+
+    def _prev_trading_day(self, now=None):
+        """计算上一个交易日（仅跳过周末，不考虑节假日调休）
+
+        Args:
+            now: datetime，默认当前时间
+        Returns:
+            date，上一个交易日
+        """
+        now = now or datetime.now()
+        d = now.date() - timedelta(days=1)
+        while d.weekday() >= 5:  # 周六=5, 周日=6
+            d -= timedelta(days=1)
+        return d
+
+    def get_latest_date(self, code):
+        """读取本地缓存最新日期
+
+        Args:
+            code: 股票代码
+        Returns:
+            str '%Y-%m-%d'，无缓存返回 None
+        """
+        code = str(code).split('.')[0]
+        filepath = os.path.join(self.data_dir, f'daily_{code}.csv')
+        if not os.path.exists(filepath):
+            return None
+        try:
+            df = pd.read_csv(filepath, encoding='utf-8-sig', usecols=['date'])
+            if df.empty:
+                return None
+            return pd.to_datetime(df['date']).max().strftime('%Y-%m-%d')
+        except Exception:
+            return None
+
+    def _spot_to_kline(self, df, trading_date):
+        """把全市场实时快照转换为当日K线记录
+
+        Args:
+            df: ak.stock_zh_a_spot / stock_zh_a_spot_em 返回的DataFrame
+            trading_date: 交易日期 '%Y-%m-%d'
+        Returns:
+            dict {code: {date, open, high, low, close, volume, amount}}
+        """
+        def num(v):
+            try:
+                x = float(v)
+                return x if not np.isnan(x) else np.nan
+            except (ValueError, TypeError):
+                return np.nan
+
+        out = {}
+        for _, row in df.iterrows():
+            code = str(row['代码'])
+            if code.startswith(('sz', 'sh', 'bj')):
+                code = code[2:]
+            close = num(row.get('最新价'))
+            if np.isnan(close):
+                continue  # 停牌或无价格的票跳过
+            out[code] = {
+                'date': trading_date,
+                'open': num(row.get('今开')),
+                'high': num(row.get('最高')),
+                'low': num(row.get('最低')),
+                'close': close,
+                'volume': num(row.get('成交量')),
+                'amount': num(row.get('成交额')),
+            }
+        return out
+
+    def _fetch_today_spot(self, trading_date):
+        """拉取全市场当日行情（新浪优先，东财备用）
+
+        Args:
+            trading_date: 交易日期 '%Y-%m-%d'
+        Returns:
+            dict {code: 当日K线记录}
+        """
+        # 优先新浪接口
+        try:
+            df = ak.stock_zh_a_spot()
+            if df is not None and '代码' in df.columns:
+                return self._spot_to_kline(df, trading_date)
+        except Exception as e:
+            print(f"新浪全市场接口失败: {e}")
+        # 东财备用
+        try:
+            df = ak.stock_zh_a_spot_em()
+            if df is not None and '代码' in df.columns:
+                return self._spot_to_kline(df, trading_date)
+        except Exception as e:
+            print(f"东财全市场接口失败: {e}")
+        return {}
+
+    def _append_kline(self, code, row):
+        """把一天K线追加/更新到本地缓存
+
+        Args:
+            code: 股票代码
+            row: dict，含 date/open/high/low/close/volume/amount
+        Returns:
+            bool
+        """
+        code = str(code).split('.')[0]
+        filepath = os.path.join(self.data_dir, f'daily_{code}.csv')
+        if not os.path.exists(filepath):
+            return False
+        try:
+            df = pd.read_csv(filepath, encoding='utf-8-sig')
+            df = df[df['date'] != row['date']]
+            new_row = pd.DataFrame([row])
+            df = pd.concat([df, new_row], ignore_index=True).sort_values('date')
+            df.to_csv(filepath, index=False, encoding='utf-8-sig')
+            return True
+        except Exception as e:
+            print(f"追加K线失败 {code}: {e}")
+            return False
+
+    def batch_update_daily_hybrid(self, thread_num=20):
+        """混合每日更新
+
+        先扫描本地数据：
+        - 最新日期==上一交易日 的票：用全市场接口一次性补齐今日K线
+        - 最新日期<上一交易日 的票（断档）：用个股接口完整拉取
+        不考虑节假日调休，仅跳过周末。
+
+        Args:
+            thread_num: 断档个股查询线程数
+        Returns:
+            bool
+        """
+        now = datetime.now()
+        today_str = now.strftime('%Y-%m-%d')
+        prev_day = self._prev_trading_day(now)
+        prev_str = prev_day.strftime('%Y-%m-%d')
+
+        stocks = self._get_stock_list()
+        if not stocks:
+            print("获取股票列表失败")
+            return False
+
+        fresh_codes = []   # 已到上一交易日，只需补今日
+        stale_codes = []   # 断档，需完整查询
+        for s in stocks:
+            code = str(s['code'])
+            latest = self.get_latest_date(code)
+            if latest == prev_str:
+                fresh_codes.append(code)
+            elif latest and latest != today_str:
+                stale_codes.append(code)
+            # latest==today 已是最新，跳过；无缓存的不处理
+
+        print(f"上一交易日: {prev_str}, 今日: {today_str}")
+        print(f"已到上一交易日、需补今日的票: {len(fresh_codes)}")
+        print(f"断档、需完整查询的票: {len(stale_codes)}")
+
+        # 1. 全市场接口补齐今日
+        if fresh_codes:
+            print("拉取全市场当日行情...")
+            spot = self._fetch_today_spot(today_str)
+            updated = 0
+            for code in fresh_codes:
+                if code in spot:
+                    if self._append_kline(code, spot[code]):
+                        updated += 1
+            print(f"全市场接口补今日完成: {updated}/{len(fresh_codes)}")
+
+        # 2. 断档票：删除缓存后完整拉取
+        if stale_codes:
+            print("断档票完整查询中...")
+            total, success = len(stale_codes), 0
+
+            def reload(code):
+                filepath = os.path.join(self.data_dir, f'daily_{code}.csv')
+                if os.path.exists(filepath):
+                    os.remove(filepath)  # 强制全新拉取
+                try:
+                    df = self.get_history_data(code)
+                    return df is not None and not df.empty
+                except Exception:
+                    return False
+
+            if self.single_thread:
+                for code in stale_codes:
+                    if reload(code):
+                        success += 1
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=thread_num) as executor:
+                    future_to_code = {executor.submit(reload, c): c for c in stale_codes}
+                    for future in concurrent.futures.as_completed(future_to_code):
+                        if future.result():
+                            success += 1
+            print(f"断档票完整查询完成: {success}/{total}")
+
+        return True
 
     def get_random_stock_code(self):
         """获取随机股票代码"""

@@ -45,7 +45,10 @@ class MillenKampStrategy(bt.Strategy):
                 self.process_fundamental_data(symbol, finance_data)
     
     def process_fundamental_data(self, symbol, finance_data):
-        """处理财务数据"""
+        """处理财务数据
+        
+        字段名对应 stock_financial_analysis_indicator 返回的中文列名
+        """
         try:
             # finance_data 为记录列表，按日期倒序排序后取最近5期
             sorted_data = sorted(finance_data, key=lambda x: x.get('日期', ''), reverse=True)
@@ -54,18 +57,29 @@ class MillenKampStrategy(bt.Strategy):
                 report_date = report.get('日期', '')
                 
                 yearly_data[report_date] = {
-                    'roe': float(report.get('净资产收益率', 0)),
-                    'eps': float(report.get('每股收益', 0)),
-                    'current_ratio': float(report.get('流动比率', 0)),
-                    'pe': float(report.get('市盈率', 0)),
-                    'pb': float(report.get('市净率', 0)),
-                    'pcf': float(report.get('市现率', 0))
+                    'roe': self._safe_float(report.get('净资产收益率(%)', 0)),
+                    'eps': self._safe_float(report.get('摊薄每股收益(元)', 0)),
+                    'current_ratio': self._safe_float(report.get('流动比率', 0)),
+                    'pe': self._safe_float(report.get('市盈率', 0)),
+                    'pb': self._safe_float(report.get('市净率', 0)),
+                    'pcf': self._safe_float(report.get('市现率', 0)),
                 }
             
             self.fundamental_data[symbol] = yearly_data
             
         except (KeyError, ValueError, IndexError, TypeError) as e:
             print(f"处理财务数据出错 - {symbol}: {str(e)}")
+    
+    @staticmethod
+    def _safe_float(value):
+        """安全转换为浮点数，处理带单位/百分号的字符串"""
+        if value is None or value == '' or value == '-':
+            return 0.0
+        try:
+            s = str(value).replace(',', '').replace('%', '').replace('元', '')
+            return float(s)
+        except (ValueError, TypeError):
+            return 0.0
     
     def next(self):
         """每个交易日调用一次"""
@@ -167,7 +181,11 @@ class MillenKampStrategy(bt.Strategy):
         target_stocks = set([x[0] for x in sorted_candidates[:self.p.max_positions]])
         
         # 当前持仓
-        current_stocks = set([d._name for d, pos in self.positions.items() if pos.size > 0])
+        current_stocks = set()
+        for data in self.datas:
+            pos = self.getposition(data)
+            if pos.size > 0:
+                current_stocks.add(data._name)
         
         # 生成买卖清单
         to_sell = [d for d in self.datas if d._name in (current_stocks - target_stocks)]

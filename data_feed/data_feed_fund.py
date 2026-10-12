@@ -45,7 +45,8 @@ class FundData:
         filepath = os.path.join(self.data_dir, filename)
         if os.path.exists(filepath):
             try:
-                df = pd.read_csv(filepath, encoding='utf-8', dtype={'code': str})
+                # 读取时指定所有列都作为字符串，避免日期等列被自动转换为数字
+                df = pd.read_csv(filepath, encoding='utf-8-sig', dtype=str)
                 if self.verbose_output:
                     print(f"加载数据: {os.path.abspath(filepath)}")
                 return df.to_dict(orient='records')
@@ -66,24 +67,75 @@ class FundData:
 
             # 在线获取
             print("获取最新基金列表...")
-            # 获取LOF基金列表
-            df_lof = ak.fund_lof_spot_em()
-            # 获取ETF基金列表
-            df_etf = ak.fund_etf_spot_em()
-            # 获取封闭式基金列表
-            df_close = ak.fund_close_spot_em()
+            
+            # 获取LOF基金列表(带重试)
+            df_lof = None
+            for attempt in range(3):
+                try:
+                    df_lof = ak.fund_lof_spot_em()
+                    if df_lof is not None and not df_lof.empty:
+                        print(f"成功获取LOF基金列表: {len(df_lof)} 只")
+                        break
+                except Exception as e:
+                    print(f"获取LOF基金列表第 {attempt + 1}/3 次失败: {e}")
+                    if attempt < 2:
+                        time.sleep(3 * (attempt + 1))
+            
+            # 获取ETF基金列表(带重试)
+            df_etf = None
+            for attempt in range(3):
+                try:
+                    df_etf = ak.fund_etf_spot_em()
+                    if df_etf is not None and not df_etf.empty:
+                        print(f"成功获取ETF基金列表: {len(df_etf)} 只")
+                        break
+                except Exception as e:
+                    print(f"获取ETF基金列表第 {attempt + 1}/3 次失败: {e}")
+                    if attempt < 2:
+                        time.sleep(3 * (attempt + 1))
+            
+            # 封闭式基金接口已废弃,仅获取ETF和LOF
+            df_close = None
+            # for attempt in range(3):
+            #     try:
+            #         df_close = ak.fund_close_spot_em()
+            #         if df_close is not None and not df_close.empty:
+            #             print(f"成功获取封闭式基金列表: {len(df_close)} 只")
+            #             break
+            #     except Exception as e:
+            #         print(f"获取封闭式基金列表第 {attempt + 1}/3 次失败: {e}")
+            #         if attempt < 2:
+            #             time.sleep(3 * (attempt + 1))
+            
+            # 如果所有接口都失败,回退到缓存(即使过期)
+            if (df_lof is None or df_lof.empty) and \
+               (df_etf is None or df_etf.empty) and \
+               (df_close is None or df_close.empty):
+                cached_data = self.load_from_csv(cache_file)
+                if cached_data:
+                    print("在线获取基金列表失败,回退到缓存数据")
+                    return [fund for fund in cached_data if fund['update_time']]
+                print("获取基金列表失败")
+                return []
 
             # 提取基金信息
             funds = []
             for df, fund_type in [(df_lof, 'LOF'), (df_etf, 'ETF'), (df_close, '封闭式')]:
-                for _, row in df.iterrows():
-                    funds.append({
-                        'name': row['名称'],
-                        'code': row['代码'],
-                        'price': float(row['最新价']),
-                        'type': fund_type,
-                        'update_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    })
+                if df is not None and not df.empty:
+                    for _, row in df.iterrows():
+                        try:
+                            funds.append({
+                                'name': row['名称'],
+                                'code': row['代码'],
+                                'price': float(row['最新价']),
+                                'type': fund_type,
+                                'update_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            })
+                        except Exception as e:
+                            if self.verbose_output:
+                                print(f"处理基金 {row.get('代码', 'unknown')} 数据时出错: {e}")
+                            continue
+            
             # 按code排序
             funds.sort(key=lambda x: x['code'])
             # 去重（有些基金可能在多个列表中）
@@ -101,6 +153,11 @@ class FundData:
 
         except Exception as e:
             print(f"获取基金列表出错: {str(e)}")
+            # 尝试回退到缓存
+            cached_data = self.load_from_csv(cache_file)
+            if cached_data:
+                print("回退到缓存基金列表")
+                return [fund for fund in cached_data if fund['update_time']]
             return []
     
     def get_history_data(self, code, start_date=None, end_date=None, local_only=False):
@@ -172,48 +229,64 @@ class FundData:
                 print(f"外部查询时间范围: {start_date} 到 {end_date}")
 
             # 获取基金数据
-            symbol = code  # 基金代码格式处理
+            # 主数据源: 新浪接口 (fund_etf_hist_sina)
+            df_new = None  # 初始化变量
+            
+            # 构建市场前缀 (新浪接口需要)
+            # 基金代码以5开头是上交所(sh),以1开头是深交所(sz)
+            if code.startswith('5'):
+                sina_symbol = f"sh{code}"  # 上交所
+            elif code.startswith('1'):
+                sina_symbol = f"sz{code}"  # 深交所
+            else:
+                sina_symbol = f"sz{code}"  # 默认深交所
+            
+            # 尝试从新浪接口获取数据
+            ssl_error_count = 0
             for i in range(5):
                 try:
-                    # 从akshare获取数据
-                    df_new = ak.fund_etf_hist_em(
-                        symbol=symbol,
-                        start_date=start_date.strftime('%Y%m%d'),
-                        end_date=end_date.strftime('%Y%m%d'),
-                        adjust='qfq'  # 前复权数据
-                    )
+                    # 新浪接口返回全部历史数据,没有日期参数
+                    df_new = ak.fund_etf_hist_sina(symbol=sina_symbol)
                     
-                    if df_new is None or df_new.empty:
-                        print(f"没有获取到数据: {code},akshare返回空数据")
-                    break
+                    if df_new is not None and not df_new.empty:
+                        if self.verbose_output:
+                            print(f"成功从新浪接口获取基金数据: {sina_symbol}")
+                        break
+                    else:
+                        print(f"新浪接口返回空数据: {code}")
                 except Exception as e:
-                    print(f"获取基金数据接口出错 - {code}: {str(e)}")
+                    error_msg = str(e)
+                    # 检测SSL证书错误
+                    if 'SSL' in error_msg or 'CERTIFICATE_VERIFY_FAILED' in error_msg or 'Hostname mismatch' in error_msg:
+                        ssl_error_count += 1
+                        if ssl_error_count == 1:  # 只在第一次SSL错误时提示
+                            print(f"⚠️ SSL证书验证失败 - {code}: 可能是网络代理或证书问题")
+                            print(f"   建议检查: 1) 是否使用代理 2) 系统时间是否正确 3) 继续重试...")
+                        if ssl_error_count >= 3:  # SSL错误超过3次，跳过该基金
+                            print(f"SSL错误持续发生，跳过基金 {code}")
+                            df_new = None
+                            break
+                    else:
+                        print(f"新浪接口获取基金数据出错 - {code}: {error_msg}")
                     time.sleep(random.uniform(30, 60))
             
             if df_new is None or df_new.empty:
-                print(f"没有获取到数据: {code},akshare返回空数据")
-                if df: 
+                print(f"没有获取到数据: {code},新浪接口返回空数据")
+                # 返回之前已有的数据(如果有)
+                if df is not None and not df.empty: 
                     return df
                 else: 
                     return None
             
-            # 重命名列以匹配backtrader要求
-            rename_dict = {
-                '日期': 'date',
-                '开盘': 'open',
-                '收盘': 'close',
-                '最高': 'high',
-                '最低': 'low',
-                '成交量': 'volume',
-                '成交额': 'amount',
-                '振幅': 'amplitude',
-                '涨跌幅': 'pct_change',
-                '涨跌额': 'change',
-                '换手率': 'turnover',
-                '基金代码': 'code'
-            }
+            # 新浪接口列名已经是英文,只需确保包含必要列
+            # 列名: ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'postVol', 'postAmt']
+            required_columns = ['date', 'open', 'high', 'low', 'close', 'volume']
             
-            df_new.rename(columns=rename_dict, inplace=True)
+            # 确保必要的列存在
+            for col in required_columns:
+                if col not in df_new.columns:
+                    print(f"警告: {code} 数据缺少必要列: {col}")
+                    return None
             
             # 转换日期列为datetime
             df_new['date'] = pd.to_datetime(df_new['date'])

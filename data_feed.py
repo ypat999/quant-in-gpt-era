@@ -63,7 +63,8 @@ class StockDataOld:
         filepath = os.path.join(self.data_dir, filename)
         if os.path.exists(filepath):
             try:
-                df = pd.read_csv(filepath, encoding='utf-8', dtype={'code': str})
+                # 读取时指定日期列和其他可能的数字列都作为字符串
+                df = pd.read_csv(filepath, encoding='utf-8-sig', dtype=str)
                 if self.verbose_output:
                     print(f"加载数据: {os.path.abspath(filepath)}")
                 return df.to_dict(orient='records')
@@ -79,7 +80,13 @@ class StockDataOld:
     def request_with_delay(self, func, *args, **kwargs):
         """带延迟的API请求"""
         now = time.time()
-        elapsed = now - self.last_request_time
+        # 确保last_request_time也是float类型
+        if isinstance(self.last_request_time, datetime):
+            last_time = self.last_request_time.timestamp()
+        else:
+            last_time = self.last_request_time
+        
+        elapsed = now - last_time
         if elapsed < self.min_request_interval:
             time.sleep(self.min_request_interval - elapsed + random.random())
         self.last_request_time = time.time()
@@ -178,41 +185,38 @@ class StockDataOld:
                 # 检查数据是否超过3个月
                 if '日期' in cached_data[0]:
                     # 解析最新财务数据的日期
-                    latest_date_str = str(cached_data[0]['日期'])
-                    latest_date = datetime.strptime(latest_date_str, '%Y%m%d')
-                    current_date = datetime.now()
-                    
-                    # 如果数据超过3个月，则重新获取
-                    if (current_date - latest_date).days > 90:
-                        print(f"财务数据已超过3个月，重新获取: {stock_code}")
-                    else:
-                        if self.verbose_output:
-                            print(f"使用缓存的财务数据: {os.path.abspath(filepath)}")
-                        return cached_data
+                    try:
+                        latest_date_str = str(cached_data[0]['日期'])
+                        # 处理可能的float格式，如20260619.0
+                        if '.' in latest_date_str:
+                            latest_date_str = latest_date_str.split('.')[0]
+                        latest_date = datetime.strptime(latest_date_str, '%Y%m%d')
+                        current_date = datetime.now()
+                        
+                        # 如果数据超过3个月，则重新获取
+                        if (current_date - latest_date).days > 90:
+                            print(f"财务数据已超过3个月，重新获取: {stock_code}")
+                        else:
+                            if self.verbose_output:
+                                print(f"使用缓存的财务数据: {os.path.abspath(filepath)}")
+                            return cached_data
+                    except (ValueError, TypeError) as e:
+                        # 日期解析失败，重新获取
+                        print(f"财务数据日期解析失败: {stock_code}, 重新获取")
+                        pass
             
             # 在线获取数据
             print(f"在线获取股票财务数据: {stock_code}")
-            # df = self.request_with_delay(ak.stock_financial_analysis_indicator, symbol=stock_code)
-            df = ak.stock_financial_abstract(symbol=stock_code)
+            # 使用 stock_financial_analysis_indicator 获取详细财务指标（含ROE、净利率等）
+            df = self.request_with_delay(ak.stock_financial_analysis_indicator, symbol=stock_code)
             
-            for _ in range(3):
-                try:
-                    if df is None or df.empty:
-                        print(f"无法获取股票财务数据: {stock_code}")
-                        return None
-                except:
-                    continue
+            if df is None or df.empty:
+                print(f"无法获取股票财务数据: {stock_code}")
+                return None
             
-            # print(df)
-            # 删除df第一列
-            df = df.drop(df.columns[0], axis=1)
-            #将df的index设置为df的第一列
-            df.index = df.iloc[:, 0]
-            df = df.drop(df.columns[0], axis=1)
-            # print(df)
-            #复制df的标题并复制到第一行
-
-            
+            # stock_financial_analysis_indicator 返回格式：
+            # 行索引为财务指标名，列索引为日期
+            # 转换为：每行一个日期，列为各指标名
             df = df.T
             df.reset_index(inplace=True)
             df.rename(columns={'index': '日期'}, inplace=True)
@@ -228,6 +232,8 @@ class StockDataOld:
             
         except Exception as e:
             print(f"获取财务数据出错 - {stock_code}: {str(e)}")
+            import traceback
+            traceback.print_exc()  # 打印完整的错误堆栈
             time.sleep(random.uniform(100, 200))
             return None
 
@@ -688,8 +694,14 @@ class StockDataOld:
         for i, stock in enumerate(stocks, 1):
             try:
                 price = stock['price']
-                if np.isnan(price):
-                    print(f"股票 {code} 价格为空，跳过更新")
+                # 先转换为数值类型再检查是否为nan
+                try:
+                    price_val = float(price) if price != 'nan' else np.nan
+                except (ValueError, TypeError):
+                    price_val = np.nan
+                
+                if pd.isna(price_val):
+                    print(f"股票 {stock['code']} 价格为空，跳过更新")
                     continue
                 code = str(stock['code'])
                 name = stock['name']
@@ -748,8 +760,14 @@ class StockDataOld:
         lock = threading.Lock()
         
         def update_stock_data(stock):
-            if np.isnan(stock['price']):
-                print(f"股票 {code} 价格为空，跳过更新")
+            # 先转换为数值类型再检查是否为nan
+            try:
+                price = float(stock['price']) if stock['price'] != 'nan' else np.nan
+            except (ValueError, TypeError):
+                price = np.nan
+            
+            if pd.isna(price):
+                print(f"股票 {stock['code']} 价格为空，跳过更新")
                 return False
             nonlocal success_count, fail_count
 
@@ -837,8 +855,14 @@ class StockDataOld:
         
         for i, stock in enumerate(stocks, 1):
             try:
-                if np.isnan(stock['price']):
-                    print(f"股票 {code} 价格为空，跳过财务数据更新")
+                # 先转换为数值类型再检查是否为nan
+                try:
+                    price_val = float(stock['price']) if stock['price'] != 'nan' else np.nan
+                except (ValueError, TypeError):
+                    price_val = np.nan
+                
+                if pd.isna(price_val):
+                    print(f"股票 {stock['code']} 价格为空，跳过财务数据更新")
                     continue
 
                 code = str(stock['code'])
@@ -1049,9 +1073,11 @@ if __name__ == '__main__':
     # os.environ['HTTP_PROXY'] = 'http://127.0.0.1:10809'
     # os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:10809'
     stock_data = StockDataOld()
-    
     # 运行测试模式
     stock_data.update_all_data(test_mode=False)
+
+# 兼容别名：策略文件统一使用 from data_feed import StockData
+StockData = StockDataOld
 
 
 

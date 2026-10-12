@@ -114,15 +114,27 @@ class FOFStrategy(bt.Strategy):
             fund_returns = pd.Series([data.close[i] for i in range(self.p.period_days)])
             fund_returns = fund_returns.pct_change().dropna()
             
-            # 计算基准收益率
-            bench_returns = pd.Series([self.benchmark.close[i] for i in range(self.p.period_days)])
-            bench_returns = bench_returns.pct_change().dropna()
+            # 计算基准收益率（self.benchmark 是 DataFrame，列名为 close，索引为 date）
+            if self.benchmark is None or self.benchmark.empty:
+                return None
+            # 取最近 period_days 个交易日的基准收盘价
+            bench_close = self.benchmark['close'].iloc[-self.p.period_days:]
+            bench_returns = bench_close.pct_change().dropna()
+            
+            # 对齐长度
+            min_len = min(len(fund_returns), len(bench_returns))
+            if min_len == 0:
+                return None
+            fund_returns = fund_returns.iloc[-min_len:]
+            bench_returns = bench_returns.iloc[-min_len:]
             
             # 计算超额收益
-            excess_returns = fund_returns - bench_returns
+            excess_returns = fund_returns.values - bench_returns.values
             
             # 计算IR
-            ir = excess_returns.mean() / excess_returns.std()
+            if np.std(excess_returns) == 0:
+                return None
+            ir = np.mean(excess_returns) / np.std(excess_returns)
             
             return ir
             
@@ -133,7 +145,11 @@ class FOFStrategy(bt.Strategy):
     def get_rebalance_orders(self):
         """获取调仓订单"""
         # 当前持仓
-        current_funds = set([d._name for d, pos in self.positions.items() if pos.size > 0])
+        current_funds = set()
+        for data in self.datas:
+            pos = self.getposition(data)
+            if pos.size > 0:
+                current_funds.add(data._name)
         
         # 目标持仓
         target_funds = set(self.fund_pool.keys())
@@ -197,12 +213,26 @@ def run_strategy():
     cerebro.plot()
 
 def get_fund_list():
-    """获取基金列表
-    
-    需要实现从数据源获取基金列表的逻辑
-    """
-    # TODO: 实现基金列表获取逻辑
-    return []
+    """获取ETF基金列表"""
+    try:
+        import akshare as ak
+        df = ak.fund_etf_spot_em()
+        funds = []
+        for _, row in df.iterrows():
+            code = str(row['代码'])
+            # 过滤：仅保留沪深主市场ETF，排除债券/货币类
+            name = str(row['名称'])
+            if any(kw in name for kw in ['债券', '货币', '国债', '短债']):
+                continue
+            funds.append({
+                'code': code,
+                'name': name,
+            })
+        print(f"获取到 {len(funds)} 只ETF基金")
+        return funds
+    except Exception as e:
+        print(f"获取基金列表出错: {str(e)}")
+        return []
 
 if __name__ == '__main__':
     run_strategy() 
